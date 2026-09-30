@@ -82,18 +82,32 @@ func TestComputeImmediateSettlement(t *testing.T) {
 	}
 }
 
-func TestRoundHalfUp(t *testing.T) {
+func TestProrateAmount(t *testing.T) {
 	cases := []struct {
-		in   float64
-		want int64
+		name              string
+		diff, part, whole int64
+		want              int64
 	}{
-		{0.5, 1}, {1.5, 2}, {2.5, 3}, {-0.5, -1}, {-1.5, -2},
-		{1.49, 1}, {-1.49, -1}, {0, 0},
+		{"exact", 3100, 21, 31, 2100},
+		{"exact negative", -3100, 21, 31, -2100},
+		{"half up", 1, 1, 2, 1},            // 0.5 -> 1
+		{"half up negative", -1, 1, 2, -1}, // -0.5 -> -1
+		{"just below half", 149, 1, 100, 1},
+		{"just below half negative", -149, 1, 100, -1},
+		{"round down", 2500, 28, 31, 2258}, // 2258.06... -> 2258
+		{"zero diff", 0, 10, 31, 0},
+		{"zero part", 3100, 0, 31, 0},
+		{"full part", 3100, 31, 31, 3100},
+		{"degenerate whole", 700, 3, 0, 700},
+		{"large amount exact", 9999999999, 29, 30, 9666666666}, // 9666666665.7 -> 9666666666
 	}
 	for _, c := range cases {
-		if got := roundHalfUp(c.in); got != c.want {
-			t.Errorf("roundHalfUp(%v) = %d, want %d", c.in, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			if got := prorateAmount(c.diff, c.part, c.whole); got != c.want {
+				t.Errorf("prorateAmount(%d, %d, %d) = %d, want %d",
+					c.diff, c.part, c.whole, got, c.want)
+			}
+		})
 	}
 }
 

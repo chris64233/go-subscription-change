@@ -671,3 +671,139 @@ func TestTimeHelpers(t *testing.T) {
 		t.Fatalf("boundary = %s want 2026-02-28", nb)
 	}
 }
+
+// ---- 12. 终止后的写操作守卫与申请号重试 ----
+
+func TestTerminatedSubscriptionRejectsWrites(t *testing.T) {
+	f := newFixture(t, "2026-01-10T00:00:00Z")
+	f.createPlan("a", "A", 1000)
+	f.createPlan("b", "B", 2000)
+	f.createSub("s1", "a")
+	ch := f.mustChange("s1", "t1", "b", EffectiveNextPeriod)
+
+	if _, err := f.svc.TerminateSubscription(f.ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 同一外部申请号的重试仍稳定返回原申请（幂等优先于终止校验）。
+	retry, err := f.svc.ApplyChange(f.ctx, ChangeInput{SubscriptionID: "s1", ClientToken: "t1", TargetPlanID: "b", EffectiveType: EffectiveNextPeriod})
+	if err != nil {
+		t.Fatalf("token retry after terminate: %v", err)
+	}
+	if retry.ID != ch.ID || retry.Status != ChangeTerminated {
+		t.Fatalf("retry = %+v, want original terminated change", retry)
+	}
+
+	// 新申请 / 替换 / 推进均被拒绝。
+	if _, err := f.svc.ApplyChange(f.ctx, ChangeInput{SubscriptionID: "s1", ClientToken: "t2", TargetPlanID: "b", EffectiveType: EffectiveImmediate}); !errors.Is(err, ErrSubscriptionEnded) {
+		t.Fatalf("apply after terminate err = %v want ErrSubscriptionEnded", err)
+	}
+	if _, err := f.svc.ReplaceChange(f.ctx, ChangeInput{SubscriptionID: "s1", ClientToken: "t3", TargetPlanID: "b", EffectiveType: EffectiveImmediate}); !errors.Is(err, ErrSubscriptionEnded) {
+		t.Fatalf("replace after terminate err = %v want ErrSubscriptionEnded", err)
+	}
+	if _, err := f.svc.CancelChange(f.ctx, "s1"); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("cancel after terminate err = %v want ErrNotPending", err)
+	}
+}
+
+// ---- 13. 替换的幂等重放与旧申请号归属 ----
+
+func TestReplaceIdempotentReplay(t *testing.T) {
+	f := newFixture(t, "2026-01-10T00:00:00Z")
+	f.createPlan("a", "A", 1000)
+	f.createPlan("b", "B", 2000)
+	f.createPlan("c", "C", 3000)
+	f.createSub("s1", "a")
+	old := f.mustChange("s1", "r1", "b", EffectiveNextPeriod)
+
+	in := ChangeInput{SubscriptionID: "s1", ClientToken: "r2", TargetPlanID: "c", EffectiveType: EffectiveImmediate}
+	first, err := f.svc.ReplaceChange(f.ctx, in)
+	if err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	// 同一 clientToken 重试替换：返回第一次创建的申请，不再产生新申请。
+	replay, err := f.svc.ReplaceChange(f.ctx, in)
+	if err != nil {
+		t.Fatalf("replace replay: %v", err)
+	}
+	if replay.ID != first.ID {
+		t.Fatalf("replay created %s, want %s", replay.ID, first.ID)
+	}
+	var changeCount int
+	_ = f.store.View(func(tx *Tx) error { changeCount = len(tx.d.changes); return nil })
+	if changeCount != 2 {
+		t.Fatalf("changes = %d want 2 (old + replacement)", changeCount)
+	}
+
+	// 旧申请的外部申请号保留历史归属：换内容复用 -> 冲突。
+	_, err = f.svc.ReplaceChange(f.ctx, ChangeInput{SubscriptionID: "s1", ClientToken: "r1", TargetPlanID: "c", EffectiveType: EffectiveImmediate})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("reuse superseded token err = %v want ErrConflict", err)
+	}
+	// 旧申请号 + 原内容重放：返回旧申请本身（幂等），不报错。
+	dup, err := f.svc.ReplaceChange(f.ctx, ChangeInput{SubscriptionID: "s1", ClientToken: "r1", TargetPlanID: "b", EffectiveType: EffectiveNextPeriod})
+	if err != nil {
+		t.Fatalf("superseded token replay: %v", err)
+	}
+	if dup.ID != old.ID {
+		t.Fatalf("replay = %s want old %s", dup.ID, old.ID)
+	}
+}
+
+// ---- 14. 按申请号推进（外部执行者路径）----
+
+func TestAdvanceChangeByID(t *testing.T) {
+	f := newFixture(t, "2026-01-10T00:00:00Z")
+	f.createPlan("a", "A", 1000)
+	f.createPlan("b", "B", 2000)
+	f.createSub("s1", "a")
+	ch := f.mustChange("s1", "tok", "b", EffectiveImmediate)
+
+	res, err := f.svc.AdvanceChange(f.ctx, ch.ID)
+	if err != nil {
+		t.Fatalf("advance by id: %v", err)
+	}
+	if res.Change.Status != ChangeEffective || res.Bill.ChangeID != ch.ID || res.Notification.ChangeID != ch.ID {
+		t.Fatalf("result = %+v", res)
+	}
+	sub, _ := f.svc.GetSubscription(f.ctx, "s1")
+	if sub.CurrentPlanID != "b" {
+		t.Fatalf("plan = %s want b", sub.CurrentPlanID)
+	}
+	// 不存在的申请号 -> 404 族错误。
+	if _, err := f.svc.AdvanceChange(f.ctx, "change-999999"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing change err = %v want ErrNotFound", err)
+	}
+}
+
+// ---- 15. 月末开通的周期钳制与跨周期推进 ----
+
+func TestMonthEndSubscriptionPeriods(t *testing.T) {
+	// 1/31 开通：首周期 1/31 ~ 2/28（钳制到 2 月最后一天）。
+	f := newFixture(t, "2026-01-31T10:00:00Z")
+	f.createPlan("a", "A", 1000)
+	f.createPlan("b", "B", 2000)
+	sub := f.createSub("s1", "a")
+	if !sub.PeriodStart.Equal(mustDate(t, "2026-01-31T00:00:00Z")) ||
+		!sub.PeriodEnd.Equal(mustDate(t, "2026-02-28T00:00:00Z")) {
+		t.Fatalf("first period = %s~%s", sub.PeriodStart, sub.PeriodEnd)
+	}
+
+	// 下一周期变更冻结 2/28 ~ 3/28。
+	ch := f.mustChange("s1", "", "b", EffectiveNextPeriod)
+	if !ch.EffectiveAt.Equal(mustDate(t, "2026-02-28T00:00:00Z")) ||
+		!ch.FrozenPeriodEnd.Equal(mustDate(t, "2026-03-28T00:00:00Z")) {
+		t.Fatalf("frozen next period = %s~%s", ch.FrozenPeriodStart, ch.FrozenPeriodEnd)
+	}
+
+	// 边界推进后订阅周期切换到冻结区间。
+	f.clock.Set(mustDate(t, "2026-02-28T00:00:00Z"))
+	if _, err := f.svc.AdvanceSubscription(f.ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	sub2, _ := f.svc.GetSubscription(f.ctx, "s1")
+	if !sub2.PeriodStart.Equal(mustDate(t, "2026-02-28T00:00:00Z")) ||
+		!sub2.PeriodEnd.Equal(mustDate(t, "2026-03-28T00:00:00Z")) {
+		t.Fatalf("period after advance = %s~%s", sub2.PeriodStart, sub2.PeriodEnd)
+	}
+}

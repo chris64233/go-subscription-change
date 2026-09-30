@@ -271,3 +271,72 @@ func TestAPIAddPlanPriceFreeze(t *testing.T) {
 		t.Fatalf("bill amount=%v want frozen 4100", bill["amount"])
 	}
 }
+
+// errCode 从错误响应体中取出 error.code。
+func errCode(t *testing.T, body any) string {
+	t.Helper()
+	e := asMap(t, asMap(t, body)["error"])
+	code, _ := e["code"].(string)
+	return code
+}
+
+func TestAPIReplaceOptimisticLock(t *testing.T) {
+	h, _, _ := newTestServer(t, "2026-01-10T00:00:00Z")
+	doJSON(t, h, "POST", "/plans", map[string]any{"id": "a", "name": "A", "currency": "CNY", "price": 1000})
+	doJSON(t, h, "POST", "/plans", map[string]any{"id": "b", "name": "B", "currency": "CNY", "price": 2000})
+	doJSON(t, h, "POST", "/subscriptions", map[string]any{"id": "s1", "planId": "a"})
+
+	st, chAny := doJSON(t, h, "POST", "/subscriptions/s1/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "NEXT_PERIOD"})
+	if st != 201 {
+		t.Fatalf("apply st=%d", st)
+	}
+	oldID := asMap(t, chAny)["id"].(string)
+
+	// 期望申请 ID 不匹配 -> 409 CONCURRENT_UPDATE，不发生替换。
+	st, body := doJSON(t, h, "PUT", "/subscriptions/s1/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "IMMEDIATE", "expectedChangeId": "change-999999"})
+	if st != http.StatusConflict || errCode(t, body) != "CONCURRENT_UPDATE" {
+		t.Fatalf("stale replace st=%d code=%q", st, errCode(t, body))
+	}
+	st, cur := doJSON(t, h, "GET", "/changes/"+oldID, nil)
+	if st != 200 || asMap(t, cur)["status"] != ChangePending {
+		t.Fatalf("stale replace must not supersede: %v", cur)
+	}
+
+	// 携带正确的期望 ID -> 替换成功。
+	st, repAny := doJSON(t, h, "PUT", "/subscriptions/s1/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "IMMEDIATE", "expectedChangeId": oldID})
+	if st != 200 || asMap(t, repAny)["supersedesChangeId"] != oldID {
+		t.Fatalf("replace st=%d body=%v", st, repAny)
+	}
+}
+
+func TestAPITerminatedGuards(t *testing.T) {
+	h, _, _ := newTestServer(t, "2026-01-10T00:00:00Z")
+	doJSON(t, h, "POST", "/plans", map[string]any{"id": "a", "name": "A", "currency": "CNY", "price": 1000})
+	doJSON(t, h, "POST", "/plans", map[string]any{"id": "b", "name": "B", "currency": "CNY", "price": 2000})
+	doJSON(t, h, "POST", "/subscriptions", map[string]any{"id": "s1", "planId": "a"})
+	doJSON(t, h, "POST", "/subscriptions/s1/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "NEXT_PERIOD"})
+
+	if st, _ := doJSON(t, h, "POST", "/subscriptions/s1/terminate", nil); st != 200 {
+		t.Fatalf("terminate st=%d", st)
+	}
+	// 终止后：申请 / 替换 -> 409 SUBSCRIPTION_ENDED。
+	st, body := doJSON(t, h, "POST", "/subscriptions/s1/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "IMMEDIATE"})
+	if st != http.StatusConflict || errCode(t, body) != "SUBSCRIPTION_ENDED" {
+		t.Fatalf("apply after terminate st=%d code=%q", st, errCode(t, body))
+	}
+	st, body = doJSON(t, h, "PUT", "/subscriptions/s1/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "IMMEDIATE"})
+	if st != http.StatusConflict || errCode(t, body) != "SUBSCRIPTION_ENDED" {
+		t.Fatalf("replace after terminate st=%d code=%q", st, errCode(t, body))
+	}
+	// 终止幂等，仍返回 200 与 TERMINATED。
+	st, sub := doJSON(t, h, "POST", "/subscriptions/s1/terminate", nil)
+	if st != 200 || asMap(t, sub)["status"] != SubTerminated {
+		t.Fatalf("idempotent terminate st=%d body=%v", st, sub)
+	}
+}

@@ -78,17 +78,12 @@ type settlementSpec struct {
 //	补新套餐剩余：+newPrice * remaining / total
 //	净额 = roundHalfUp((newPrice - oldPrice) * remaining / total)
 //
-// 单独对净额做一次四舍五入（最小货币单位不可分），金额以整数分存储。
+// 单独对净额做一次四舍五入（最小货币单位不可分），全程整数运算，金额以整数分存储。
 func computeImmediateSettlement(oldPrice, newPrice int64, periodStart, periodEnd, at time.Time) settlementSpec {
 	total, _, remaining := periodDayInfo(periodStart, periodEnd, at)
 	sp := settlementSpec{totalDays: total, remainDays: remaining,
 		periodStart: periodStart, periodEnd: periodEnd}
-	if total <= 0 {
-		// 退化周期不做比例分摊。
-		sp.amount = newPrice - oldPrice
-		return sp
-	}
-	sp.amount = roundHalfUp(float64(newPrice-oldPrice) * float64(remaining) / float64(total))
+	sp.amount = prorateAmount(newPrice-oldPrice, int64(remaining), int64(total))
 	return sp
 }
 
