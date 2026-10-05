@@ -24,6 +24,8 @@ import (
 //	GET    /subscriptions/{subID}/bills   账单查询
 //	GET    /subscriptions/{subID}/history 变更历史
 //	GET    /changes/{changeID}            变更申请详情
+//	POST   /changes/{changeID}/payments   提交支付结果（幂等，失败可重试）
+//	GET    /changes/{changeID}/payments   支付记录查询
 type API struct {
 	svc   *Service
 	clock Clock
@@ -55,6 +57,8 @@ func NewAPIWithClock(svc *Service, clock Clock) http.Handler {
 	mux.HandleFunc("GET /subscriptions/{subID}/history", a.listHistory)
 
 	mux.HandleFunc("GET /changes/{changeID}", a.getChange)
+	mux.HandleFunc("POST /changes/{changeID}/payments", a.submitPayment)
+	mux.HandleFunc("GET /changes/{changeID}/payments", a.listPayments)
 
 	return a.wrap(mux)
 }
@@ -96,7 +100,16 @@ type changeRequest struct {
 	ClientToken      string `json:"clientToken"`
 	TargetPlanID     string `json:"targetPlanId"`
 	EffectiveType    string `json:"effectiveType"`
+	EffectiveAt      string `json:"effectiveAt,omitempty"`    // RFC3339，仅 SCHEDULED
+	ExpectedAmount   *int64 `json:"expectedAmount,omitempty"` // 期望冻结金额（价格乐观校验）
 	ExpectedChangeID string `json:"expectedChangeId,omitempty"`
+}
+
+type paymentRequest struct {
+	ClientToken   string `json:"clientToken"`
+	Amount        int64  `json:"amount"`
+	Result        string `json:"result"` // SUCCEEDED / FAILED
+	FailureReason string `json:"failureReason,omitempty"`
 }
 
 type errorResponse struct {
@@ -153,6 +166,8 @@ func mapError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "SUBSCRIPTION_ENDED", err.Error())
 	case errors.Is(err, ErrSamePlan):
 		writeError(w, http.StatusConflict, "SAME_PLAN", err.Error())
+	case errors.Is(err, ErrAlreadyPaid):
+		writeError(w, http.StatusConflict, "ALREADY_PAID", err.Error())
 	case errors.Is(err, ErrConflict):
 		writeError(w, http.StatusConflict, "CONFLICT", err.Error())
 	case errors.Is(err, ErrConcurrentUpdate):
@@ -251,11 +266,17 @@ func (a *API) changeInput(r *http.Request) (ChangeInput, error) {
 	if err := decode(r, &req); err != nil {
 		return ChangeInput{}, err
 	}
+	effAt, err := parseTime(req.EffectiveAt)
+	if err != nil {
+		return ChangeInput{}, err
+	}
 	return ChangeInput{
 		SubscriptionID:   r.PathValue("subID"),
 		ClientToken:      strings.TrimSpace(req.ClientToken),
 		TargetPlanID:     req.TargetPlanID,
 		EffectiveType:    req.EffectiveType,
+		EffectiveAt:      effAt,
+		ExpectedAmount:   req.ExpectedAmount,
 		ExpectedChangeID: req.ExpectedChangeID,
 	}, nil
 }
@@ -340,4 +361,32 @@ func (a *API) getChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ch)
+}
+
+func (a *API) submitPayment(w http.ResponseWriter, r *http.Request) {
+	var req paymentRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "malformed JSON body")
+		return
+	}
+	p, err := a.svc.SubmitPayment(r.Context(), r.PathValue("changeID"), PaymentInput{
+		ClientToken:   strings.TrimSpace(req.ClientToken),
+		Amount:        req.Amount,
+		Result:        req.Result,
+		FailureReason: req.FailureReason,
+	})
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func (a *API) listPayments(w http.ResponseWriter, r *http.Request) {
+	ps, err := a.svc.ListPayments(r.Context(), r.PathValue("changeID"))
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ps)
 }

@@ -15,21 +15,25 @@ type storeData struct {
 	bills   map[string]*Bill
 	events  []*Event
 	// 唯一索引
-	billByChange  map[string]string // changeID -> billID
-	notifByChange map[string]*Notification
-	changeByToken map[string]string // 外部申请号 -> changeID
-	seq           int64
+	billByChange   map[string]string // changeID -> billID
+	notifByChange  map[string]*Notification
+	changeByToken  map[string]string // 外部申请号 -> changeID
+	payments       map[string]*Payment
+	paymentByToken map[string]string // 支付号 -> paymentID
+	seq            int64
 }
 
 func newStoreData() *storeData {
 	return &storeData{
-		plans:         map[string]*Plan{},
-		subs:          map[string]*Subscription{},
-		changes:       map[string]*ChangeApplication{},
-		bills:         map[string]*Bill{},
-		billByChange:  map[string]string{},
-		notifByChange: map[string]*Notification{},
-		changeByToken: map[string]string{},
+		plans:          map[string]*Plan{},
+		subs:           map[string]*Subscription{},
+		changes:        map[string]*ChangeApplication{},
+		bills:          map[string]*Bill{},
+		billByChange:   map[string]string{},
+		notifByChange:  map[string]*Notification{},
+		changeByToken:  map[string]string{},
+		payments:       map[string]*Payment{},
+		paymentByToken: map[string]string{},
 	}
 }
 
@@ -63,6 +67,13 @@ func (d *storeData) clone() *storeData {
 	}
 	for k, v := range d.changeByToken {
 		c.changeByToken[k] = v
+	}
+	for id, p := range d.payments {
+		pc := *p
+		c.payments[id] = &pc
+	}
+	for k, v := range d.paymentByToken {
+		c.paymentByToken[k] = v
 	}
 	c.events = make([]*Event, len(d.events))
 	for i, e := range d.events {
@@ -249,6 +260,59 @@ func (tx *Tx) insertNotification(n *Notification) error {
 	nc := *n
 	tx.d.notifByChange[n.ChangeID] = &nc
 	return nil
+}
+
+// ---- 支付（支付号唯一）----
+
+// insertPayment 写入支付记录；支付号（clientToken）非空时全局唯一，
+// 同一支付号的重复提交由索引拒绝（Service 层在此之前已做幂等判断）。
+func (tx *Tx) insertPayment(p *Payment) error {
+	if _, ok := tx.d.payments[p.ID]; ok {
+		return conflictf("payment %s already exists", p.ID)
+	}
+	if p.ClientToken != "" {
+		if _, exists := tx.d.paymentByToken[p.ClientToken]; exists {
+			return conflictf("payment token %s already exists", p.ClientToken)
+		}
+	}
+	pc := *p
+	tx.d.payments[p.ID] = &pc
+	if p.ClientToken != "" {
+		tx.d.paymentByToken[p.ClientToken] = p.ID
+	}
+	return nil
+}
+
+// paymentByClientToken 按支付号查找支付记录。
+func (tx *Tx) paymentByClientToken(token string) (*Payment, bool) {
+	id, ok := tx.d.paymentByToken[token]
+	if !ok {
+		return nil, false
+	}
+	p, ok := tx.d.payments[id]
+	if !ok {
+		return nil, false
+	}
+	pc := *p
+	return &pc, true
+}
+
+// listPayments 返回某笔变更的全部支付尝试（按创建顺序）。
+func (tx *Tx) listPayments(changeID string) []*Payment {
+	out := make([]*Payment, 0)
+	for _, p := range tx.d.payments {
+		if p.ChangeID == changeID {
+			pc := *p
+			out = append(out, &pc)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 // ---- 历史事件 ----

@@ -43,7 +43,10 @@ const (
 	EventChangeReplaced   = "CHANGE_REPLACED"   // 旧申请被替换
 	EventChangeCancelled  = "CHANGE_CANCELLED"  // 用户取消
 	EventChangeEffective  = "CHANGE_EFFECTIVE"  // 到期生效
+	EventChangeFailed     = "CHANGE_FAILED"     // 到期未支付，切换失败
 	EventChangeTerminated = "CHANGE_TERMINATED" // 随订阅终止而关闭
+	EventPaymentSucceeded = "PAYMENT_SUCCEEDED" // 支付确认
+	EventPaymentFailed    = "PAYMENT_FAILED"    // 支付失败（可换新支付号重试）
 	EventSubCreated       = "SUBSCRIPTION_CREATED"
 	EventSubTerminated    = "SUBSCRIPTION_TERMINATED"
 )
