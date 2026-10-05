@@ -17,6 +17,7 @@ var (
 	ErrConcurrentUpdate   = errors.New("concurrent update: version mismatch")
 	ErrNotPending         = errors.New("change is no longer pending")
 	ErrSamePlan           = errors.New("target plan is identical to current plan")
+	ErrAlreadyPaid        = errors.New("change already has a confirmed payment")
 )
 
 // conflictError 携带可读细节，仍可被 errors.Is(err, ErrConflict) 命中。

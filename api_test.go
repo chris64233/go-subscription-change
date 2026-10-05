@@ -244,6 +244,98 @@ func TestAPIBadJSON(t *testing.T) {
 	}
 }
 
+func TestAPIScheduledChangeWithPayment(t *testing.T) {
+	h, _, clk := newTestServer(t, "2026-01-10T00:00:00Z")
+	doJSON(t, h, "POST", "/plans", map[string]any{"id": "a", "name": "A", "currency": "CNY", "price": 1000})
+	doJSON(t, h, "POST", "/plans", map[string]any{"id": "b", "name": "B", "currency": "CNY", "price": 2000})
+	doJSON(t, h, "POST", "/subscriptions", map[string]any{"id": "s1", "planId": "a"})
+	doJSON(t, h, "POST", "/subscriptions", map[string]any{"id": "s2", "planId": "a"})
+
+	// 预约 1/20 生效：周期 1/10~2/10 剩 21 天，差额 (2000-1000)*21/31 = 677。
+	st, chAny := doJSON(t, h, "POST", "/subscriptions/s1/changes",
+		map[string]any{"clientToken": "sch-1", "targetPlanId": "b", "effectiveType": "SCHEDULED",
+			"effectiveAt": "2026-01-20T00:00:00Z"})
+	ch := asMap(t, chAny)
+	if st != http.StatusCreated || ch["effectiveAt"] != "2026-01-20T00:00:00Z" {
+		t.Fatalf("apply scheduled st=%d body=%v", st, chAny)
+	}
+	if int64(ch["settlementAmount"].(float64)) != 677 {
+		t.Fatalf("settlement = %v want 677", ch["settlementAmount"])
+	}
+	changeID := ch["id"].(string)
+
+	// 生效时间缺失/非法 -> 400。
+	if st, _ := doJSON(t, h, "POST", "/subscriptions/s2/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "SCHEDULED"}); st != http.StatusBadRequest {
+		t.Fatalf("missing effectiveAt st=%d want 400", st)
+	}
+	// 到期前推进 -> 400。
+	if st, _ := doJSON(t, h, "POST", "/subscriptions/s1/advance", nil); st != http.StatusBadRequest {
+		t.Fatalf("early advance st=%d want 400", st)
+	}
+	// 支付金额不符 -> 409。
+	if st, _ := doJSON(t, h, "POST", "/changes/"+changeID+"/payments",
+		map[string]any{"clientToken": "p1", "amount": 1, "result": "SUCCEEDED"}); st != http.StatusConflict {
+		t.Fatalf("wrong amount st=%d want 409", st)
+	}
+	// 确认支付 -> 201；同号重试 -> 201 同一支付。
+	st, pAny := doJSON(t, h, "POST", "/changes/"+changeID+"/payments",
+		map[string]any{"clientToken": "p1", "amount": 677, "result": "SUCCEEDED"})
+	if st != http.StatusCreated {
+		t.Fatalf("pay st=%d body=%v", st, pAny)
+	}
+	payID := asMap(t, pAny)["id"].(string)
+	st, p2Any := doJSON(t, h, "POST", "/changes/"+changeID+"/payments",
+		map[string]any{"clientToken": "p1", "amount": 677, "result": "SUCCEEDED"})
+	if st != http.StatusCreated || asMap(t, p2Any)["id"] != payID {
+		t.Fatalf("idempotent pay retry st=%d", st)
+	}
+	// 换号重复确认 -> 409 ALREADY_PAID。
+	if st, _ := doJSON(t, h, "POST", "/changes/"+changeID+"/payments",
+		map[string]any{"clientToken": "p2", "amount": 677, "result": "SUCCEEDED"}); st != http.StatusConflict {
+		t.Fatalf("duplicate pay st=%d want 409", st)
+	}
+	// 支付记录可查。
+	if st, ps := doJSON(t, h, "GET", "/changes/"+changeID+"/payments", nil); st != 200 || len(asSlice(t, ps)) != 1 {
+		t.Fatalf("list payments st=%d", st)
+	}
+	// 到达生效时间推进：生效出账。
+	clk.Set(mustDate(t, "2026-01-20T00:00:00Z"))
+	st, resAny := doJSON(t, h, "POST", "/subscriptions/s1/advance", nil)
+	res := asMap(t, resAny)
+	if st != 200 || asMap(t, res["change"])["status"] != ChangeEffective {
+		t.Fatalf("advance st=%d res=%v", st, resAny)
+	}
+	if int64(asMap(t, res["bill"])["amount"].(float64)) != 677 {
+		t.Fatalf("bill = %v want 677", res["bill"])
+	}
+
+	// 另一订阅：到期未支付 -> 切换失败，保留原套餐并记录原因。
+	st, ch2Any := doJSON(t, h, "POST", "/subscriptions/s2/changes",
+		map[string]any{"targetPlanId": "b", "effectiveType": "SCHEDULED", "effectiveAt": "2026-01-25T00:00:00Z"})
+	if st != http.StatusCreated {
+		t.Fatalf("apply s2 st=%d", st)
+	}
+	clk.Set(mustDate(t, "2026-01-25T00:00:00Z"))
+	st, res2Any := doJSON(t, h, "POST", "/subscriptions/s2/advance", nil)
+	res2 := asMap(t, res2Any)
+	ch2 := asMap(t, res2["change"])
+	if st != 200 || ch2["status"] != ChangeFailed || ch2["failureReason"] == "" {
+		t.Fatalf("unpaid advance st=%d res=%v", st, res2Any)
+	}
+	if res2["bill"] != nil {
+		t.Fatalf("failed change must not bill: %v", res2["bill"])
+	}
+	if st, s := doJSON(t, h, "GET", "/subscriptions/s2", nil); st != 200 || asMap(t, s)["currentPlanId"] != "a" {
+		t.Fatalf("original plan not kept: %v", s)
+	}
+	// 失败后迟到的支付 -> 409，不能激活已失败变更。
+	if st, _ := doJSON(t, h, "POST", "/changes/"+asMap(t, ch2Any)["id"].(string)+"/payments",
+		map[string]any{"amount": 677, "result": "SUCCEEDED"}); st != http.StatusConflict {
+		t.Fatalf("late pay st=%d want 409", st)
+	}
+}
+
 func TestAPIAddPlanPriceFreeze(t *testing.T) {
 	h, _, clk := newTestServer(t, "2026-01-11T00:00:00Z")
 	doJSON(t, h, "POST", "/plans", map[string]any{"id": "basic", "name": "Basic", "currency": "CNY", "price": 1000})
@@ -251,14 +343,21 @@ func TestAPIAddPlanPriceFreeze(t *testing.T) {
 	doJSON(t, h, "POST", "/subscriptions", map[string]any{"id": "s1", "planId": "basic"})
 
 	// 受理一笔下一周期变更，冻结 pro=4100 v1。
-	if st, _ := doJSON(t, h, "POST", "/subscriptions/s1/changes",
-		map[string]any{"targetPlanId": "pro", "effectiveType": "NEXT_PERIOD"}); st != 201 {
+	st, chAny := doJSON(t, h, "POST", "/subscriptions/s1/changes",
+		map[string]any{"targetPlanId": "pro", "effectiveType": "NEXT_PERIOD"})
+	if st != 201 {
 		t.Fatalf("apply st=%d", st)
 	}
+	changeID := asMap(t, chAny)["id"].(string)
 	// 之后 pro 涨价，新价格生效时间早于边界。
 	if st, _ := doJSON(t, h, "POST", "/plans/pro/prices",
 		map[string]any{"amount": 9999, "effectiveAt": "2026-01-20T00:00:00Z"}); st != http.StatusCreated {
 		t.Fatalf("add price st=%d", st)
+	}
+	// 差额为正：生效前确认支付（按冻结价 4100）。
+	if st, body := doJSON(t, h, "POST", "/changes/"+changeID+"/payments",
+		map[string]any{"clientToken": "p1", "amount": 4100, "result": "SUCCEEDED"}); st != http.StatusCreated {
+		t.Fatalf("pay st=%d body=%v", st, body)
 	}
 	clk.Set(mustDate(t, "2026-02-11T00:00:00Z"))
 	st, resAny := doJSON(t, h, "POST", "/subscriptions/s1/advance", nil)

@@ -66,6 +66,18 @@ func (f *fixture) mustChange(sub, token, target, effType string) *ChangeApplicat
 	return ch
 }
 
+// mustPay 为变更提交一笔成功支付。
+func (f *fixture) mustPay(changeID, token string, amount int64) *Payment {
+	f.t.Helper()
+	p, err := f.svc.SubmitPayment(f.ctx, changeID, PaymentInput{
+		ClientToken: token, Amount: amount, Result: PaymentSucceeded,
+	})
+	if err != nil {
+		f.t.Fatalf("pay change %s: %v", changeID, err)
+	}
+	return p
+}
+
 func (f *fixture) bills(sub string) []*Bill {
 	f.t.Helper()
 	bs, err := f.svc.ListBills(f.ctx, sub)
@@ -174,6 +186,9 @@ func TestNextPeriodChangeSettlesAtBoundary(t *testing.T) {
 
 	// 受理后新套餐涨价到 5000（边界前生效）—— 已受理申请仍按冻结价 3000。
 	f.addPrice("pro", 5000, "2026-01-20T00:00:00Z")
+
+	// 预约类变更差额为正：生效前完成支付确认。
+	f.mustPay(ch.ID, "pay-1", 3000)
 
 	f.clock.Set(mustDate(t, "2026-02-15T00:00:00Z"))
 	res, err := f.svc.AdvanceSubscription(f.ctx, "s1")
@@ -646,13 +661,15 @@ func TestSweepDue(t *testing.T) {
 	f.createPlan("b", "B", 2000)
 	f.createSub("s1", "a")
 	f.createSub("s2", "a")
-	f.mustChange("s1", "t1", "b", EffectiveNextPeriod)
+	ch1 := f.mustChange("s1", "t1", "b", EffectiveNextPeriod)
 	f.mustChange("s2", "t2", "b", EffectiveImmediate) // 立即到期
 
 	res := f.svc.SweepDue(f.ctx)
 	if len(res) != 1 || res[0].Change.SubscriptionID != "s2" {
 		t.Fatalf("sweep = %d results, want only s2", len(res))
 	}
+	// 下一周期变更差额为正，先支付再到期推进。
+	f.mustPay(ch1.ID, "pay-s1", 2000)
 	f.clock.Set(mustDate(t, "2026-02-10T00:00:00Z"))
 	res = f.svc.SweepDue(f.ctx)
 	if len(res) != 1 || res[0].Change.SubscriptionID != "s1" {

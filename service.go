@@ -249,7 +249,14 @@ type ChangeInput struct {
 	SubscriptionID string `json:"subscriptionId"`
 	ClientToken    string `json:"clientToken,omitempty"` // 外部申请号（幂等/冲突检测）
 	TargetPlanID   string `json:"targetPlanId"`
-	EffectiveType  string `json:"effectiveType"` // IMMEDIATE / NEXT_PERIOD
+	EffectiveType  string `json:"effectiveType"` // IMMEDIATE / NEXT_PERIOD / SCHEDULED
+	// EffectiveAt 仅 SCHEDULED 使用：指定的未来生效时间（须在当前计费周期内）。
+	// 其余类型必须为空；受理后生效时间被冻结，重复提交若生效时间不同则报冲突。
+	EffectiveAt time.Time `json:"effectiveAt,omitempty"`
+	// ExpectedAmount 可空：调用方期望的冻结差额。
+	// 非空且与按当前价格算出的差额不一致时返回冲突（价格已被改写，需重新报价）；
+	// 相同申请号重试时若期望值与已受理金额不同同样报冲突。
+	ExpectedAmount *int64 `json:"expectedAmount,omitempty"`
 	// ExpectedChangeID 仅替换时使用：调用方所看到的当前待生效申请 ID。
 	// 非空时启用乐观并发控制：当前待生效申请已被别人替换/取消/推进（ID 不匹配）
 	// 则返回 ErrConcurrentUpdate，保证并发修改不会静默互相覆盖；
@@ -263,9 +270,14 @@ type ChangeInput struct {
 //     按剩余日历日精确计算补/退差额；
 //   - NEXT_PERIOD：在下一周期边界切换，冻结原/新套餐价格与下一周期，
 //     边界收取新套餐整周期费用。
+//   - SCHEDULED：在指定的未来生效时间（当前周期内）切换，
+//     按生效时点的剩余日历日冻结差额。
+//
+// 预约类变更（NEXT_PERIOD / SCHEDULED）差额为正时需在生效前完成支付，
+// 到期仍未支付的申请置 FAILED 并保留原套餐。
 //
 // 同一订阅只能存在一笔待生效变更；相同外部申请号重复请求按幂等处理，
-// 但目标套餐或生效方式不同则报冲突。
+// 但目标套餐、价格或生效时间不同则报冲突。
 func (s *Service) ApplyChange(ctx context.Context, in ChangeInput) (*ChangeApplication, error) {
 	now := clockFrom(ctx).Now()
 	var out *ChangeApplication
@@ -425,13 +437,111 @@ func (s *Service) applyChangeTx(tx *Tx, in ChangeInput, now time.Time) (*ChangeA
 	return got, nil
 }
 
+// ---------------- 支付 ----------------
+
+// PaymentInput 是一次支付尝试的入参（模拟支付网关同步返回结果）。
+type PaymentInput struct {
+	ClientToken   string `json:"clientToken,omitempty"`   // 支付号（幂等/冲突检测）
+	Amount        int64  `json:"amount"`                  // 必须等于变更冻结的差额
+	Result        string `json:"result"`                  // SUCCEEDED / FAILED
+	FailureReason string `json:"failureReason,omitempty"` // FAILED 时的原因
+}
+
+// SubmitPayment 为待生效变更提交一次支付尝试。
+//
+//   - 支付号重复提交：同变更、同金额、同结果原样返回原支付；任一不同报冲突；
+//   - 支付失败（FAILED）只记录尝试，可换新支付号重试；
+//   - 支付确认（SUCCEEDED）把变更标记为已支付，同一变更至多确认一笔；
+//   - 变更已不在 PENDING 时拒绝：迟到的旧支付不能激活已取消/已关闭的变更。
+func (s *Service) SubmitPayment(ctx context.Context, changeID string, in PaymentInput) (*Payment, error) {
+	now := clockFrom(ctx).Now()
+	var out *Payment
+	err := s.store.Update(func(tx *Tx) error {
+		// 幂等/冲突检查优先：即使变更随后关闭，同一支付号的重试仍稳定返回原支付。
+		if in.ClientToken != "" {
+			if exist, ok := tx.paymentByClientToken(in.ClientToken); ok {
+				if exist.ChangeID == changeID && exist.Amount == in.Amount && exist.Status == in.Result {
+					out = exist // 幂等重放
+					return nil
+				}
+				return conflictf("payment token %s reused with different change, amount or result", in.ClientToken)
+			}
+		}
+		if in.Result != PaymentSucceeded && in.Result != PaymentFailed {
+			return invalidArgf("result must be %s or %s", PaymentSucceeded, PaymentFailed)
+		}
+		ch, ok := tx.getChange(changeID)
+		if !ok {
+			return notFoundf("change %s", changeID)
+		}
+		if ch.Status != ChangePending {
+			return fmt.Errorf("%w: change %s is %s", ErrNotPending, ch.ID, ch.Status)
+		}
+		if !ch.paymentRequired() {
+			return invalidArgf("change %s does not require payment", ch.ID)
+		}
+		if ch.paid() {
+			return ErrAlreadyPaid
+		}
+		if in.Amount != ch.SettlementAmount {
+			return conflictf("payment amount %d does not match frozen settlement %d",
+				in.Amount, ch.SettlementAmount)
+		}
+		p := &Payment{
+			ID:             tx.newID("pay"),
+			SubscriptionID: ch.SubscriptionID,
+			ChangeID:       ch.ID,
+			ClientToken:    in.ClientToken,
+			Amount:         in.Amount,
+			Currency:       ch.ToPlan.Currency,
+			Status:         in.Result,
+			CreatedAt:      now,
+		}
+		evType := EventPaymentFailed
+		if in.Result == PaymentSucceeded {
+			ch.PaidAt = now
+			if err := tx.saveChange(ch, ch.Version); err != nil {
+				return err
+			}
+			evType = EventPaymentSucceeded
+		} else {
+			p.FailureReason = in.FailureReason
+		}
+		if err := tx.insertPayment(p); err != nil {
+			return err
+		}
+		tx.appendEvent(&Event{SubscriptionID: ch.SubscriptionID, ChangeID: ch.ID,
+			Type:      evType,
+			Detail:    fmt.Sprintf(`{"paymentId":%q,"amount":%d}`, p.ID, p.Amount),
+			CreatedAt: now})
+		out = p
+		return nil
+	})
+	return out, err
+}
+
+// ListPayments 查询某笔变更的全部支付尝试（按创建顺序）。
+func (s *Service) ListPayments(ctx context.Context, changeID string) ([]*Payment, error) {
+	var out []*Payment
+	err := s.store.View(func(tx *Tx) error {
+		if _, ok := tx.getChange(changeID); !ok {
+			return notFoundf("change %s", changeID)
+		}
+		out = tx.listPayments(changeID)
+		return nil
+	})
+	return out, err
+}
+
 // ---------------- 到期推进（生效结算） ----------------
 
 // EffectiveResult 是一次生效推进的全部产物，三者同事务产生。
+// 若推进时申请因到期未支付而失败，Change.Status 为 FAILED，
+// Bill 与 Notification 为 nil，订阅保留原套餐。
 type EffectiveResult struct {
 	Change       *ChangeApplication `json:"change"`
-	Bill         *Bill              `json:"bill"`
-	Notification *Notification      `json:"notification"`
+	Bill         *Bill              `json:"bill,omitempty"`
+	Notification *Notification      `json:"notification,omitempty"`
 }
 
 // AdvanceSubscription 推进订阅当前待生效变更：到期则在一次原子操作中
@@ -507,10 +617,32 @@ func advanceChange(tx *Tx, sub *Subscription, changeID string, now time.Time) (*
 	subV := sub.Version
 	chV := ch.Version
 
+	// 预约类变更到期时支付仍未确认：切换失败（终态），保留原套餐并记录原因。
+	// 支付确认 / 取消 / 到期推进并发时，以先提交事务的版本为准，结果确定。
+	if ch.paymentRequired() && !ch.paid() {
+		ch.Status = ChangeFailed
+		ch.FailureReason = fmt.Sprintf("payment not completed before effective time %s", ch.EffectiveAt)
+		ch.DecidedAt = now
+		sub.PendingChangeID = ""
+		if err := tx.saveChange(ch, chV); err != nil {
+			return nil, err
+		}
+		if err := tx.saveSubscription(sub, subV); err != nil {
+			return nil, err
+		}
+		tx.appendEvent(&Event{SubscriptionID: sub.ID, ChangeID: ch.ID,
+			Type:      EventChangeFailed,
+			Detail:    fmt.Sprintf(`{"reason":%q}`, ch.FailureReason),
+			CreatedAt: now})
+		gotCh, _ := tx.getChange(ch.ID)
+		return &EffectiveResult{Change: gotCh}, nil
+	}
+
 	// 1) 切换套餐。立即变更保留当前周期（按日比例已结算）；
 	//    下一周期变更把周期推进到冻结的下一周期。
 	sub.CurrentPlanID = ch.ToPlan.PlanID
-	if ch.EffectiveType == EffectiveNextPeriod {
+	switch ch.EffectiveType {
+	case EffectiveNextPeriod:
 		sub.PeriodStart = ch.FrozenPeriodStart
 		sub.PeriodEnd = ch.FrozenPeriodEnd
 	}
@@ -662,8 +794,9 @@ func loadActiveSub(tx *Tx, id string) (*Subscription, error) {
 
 // checkClientToken 处理外部申请号：
 //   - 号不存在：返回 (nil, nil)；
-//   - 同订阅、同目标套餐、同生效方式：返回已存在申请（调用方按幂等重放）；
-//   - 其余情况（不同订阅，或目标套餐/生效方式不同）：返回冲突。
+//   - 同订阅、同目标套餐、同生效方式、同生效时间、同期望金额：
+//     返回已存在申请（调用方按幂等重放）；
+//   - 其余情况（不同订阅，或套餐/价格/生效时间任一不同）：返回冲突。
 func checkClientToken(tx *Tx, in ChangeInput) (*ChangeApplication, error) {
 	if in.ClientToken == "" {
 		return nil, nil
@@ -675,10 +808,18 @@ func checkClientToken(tx *Tx, in ChangeInput) (*ChangeApplication, error) {
 	if exist.SubscriptionID != in.SubscriptionID {
 		return nil, conflictf("client token %s already bound to another subscription", in.ClientToken)
 	}
-	if exist.ToPlan.PlanID == in.TargetPlanID && exist.EffectiveType == in.EffectiveType {
+	// 生效时间：SCHEDULED 申请必须显式一致；其余类型不允许携带生效时间。
+	sameTime := true
+	if exist.EffectiveType == EffectiveScheduled || !in.EffectiveAt.IsZero() {
+		sameTime = !in.EffectiveAt.IsZero() && in.EffectiveAt.UTC().Equal(exist.EffectiveAt)
+	}
+	// 价格：调用方声明期望金额时必须与已冻结金额一致。
+	sameAmount := in.ExpectedAmount == nil || *in.ExpectedAmount == exist.SettlementAmount
+	if exist.ToPlan.PlanID == in.TargetPlanID && exist.EffectiveType == in.EffectiveType &&
+		sameTime && sameAmount {
 		return exist, nil
 	}
-	return nil, conflictf("client token %s reused with different target plan or effective type", in.ClientToken)
+	return nil, conflictf("client token %s reused with different plan, price or effective time", in.ClientToken)
 }
 
 // buildPendingChange 校验套餐与入参，按当前价格版本冻结计费要素。
@@ -687,8 +828,13 @@ func buildPendingChange(tx *Tx, sub *Subscription, in ChangeInput, now time.Time
 	if in.TargetPlanID == "" || in.EffectiveType == "" {
 		return nil, nil, invalidArgf("targetPlanId and effectiveType are required")
 	}
-	if in.EffectiveType != EffectiveImmediate && in.EffectiveType != EffectiveNextPeriod {
-		return nil, nil, invalidArgf("effectiveType must be %s or %s", EffectiveImmediate, EffectiveNextPeriod)
+	if in.EffectiveType != EffectiveImmediate && in.EffectiveType != EffectiveNextPeriod &&
+		in.EffectiveType != EffectiveScheduled {
+		return nil, nil, invalidArgf("effectiveType must be %s, %s or %s",
+			EffectiveImmediate, EffectiveNextPeriod, EffectiveScheduled)
+	}
+	if in.EffectiveType != EffectiveScheduled && !in.EffectiveAt.IsZero() {
+		return nil, nil, invalidArgf("effectiveAt is only allowed for %s", EffectiveScheduled)
 	}
 	from, ok := tx.getPlan(sub.CurrentPlanID)
 	if !ok {
@@ -743,6 +889,29 @@ func buildPendingChange(tx *Tx, sub *Subscription, in ChangeInput, now time.Time
 		ch.SettlementAmount = sp.amount
 		ch.ProrationTotalDays = sp.totalDays
 		ch.ProrationRemainDays = sp.remainDays
+	case EffectiveScheduled:
+		effAt := in.EffectiveAt.UTC()
+		if !effAt.After(now) {
+			return nil, nil, invalidArgf("effectiveAt %s must be in the future (now %s)", effAt, now)
+		}
+		if !effAt.Before(sub.PeriodEnd) {
+			return nil, nil, invalidArgf("effectiveAt %s must be before current period end %s (use %s for boundary switch)",
+				effAt, sub.PeriodEnd, EffectiveNextPeriod)
+		}
+		// 按生效时点的剩余日历日冻结差额，到期切换、周期不变。
+		sp := computeImmediateSettlement(fromPV.Amount, toPV.Amount, sub.PeriodStart, sub.PeriodEnd, effAt)
+		ch.EffectiveAt = effAt
+		ch.FrozenPeriodStart = sp.periodStart
+		ch.FrozenPeriodEnd = sp.periodEnd
+		ch.SettlementAmount = sp.amount
+		ch.ProrationTotalDays = sp.totalDays
+		ch.ProrationRemainDays = sp.remainDays
+	}
+	// 价格乐观校验：调用方声明的期望金额与按当前价格算出的冻结金额不一致，
+	// 说明价格规则在报价后已被改写，拒绝受理并让调用方重新报价。
+	if in.ExpectedAmount != nil && *in.ExpectedAmount != ch.SettlementAmount {
+		return nil, nil, conflictf("price changed: expected settlement %d but current is %d",
+			*in.ExpectedAmount, ch.SettlementAmount)
 	}
 	return ch, &sub2, nil
 }

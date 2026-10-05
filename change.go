@@ -10,18 +10,23 @@ const (
 	// EffectiveNextPeriod 在下一计费周期边界变更：
 	// 周期边界一次性切换，并按新套餐冻结价格收取下一周期费用。
 	EffectiveNextPeriod = "NEXT_PERIOD"
+	// EffectiveScheduled 在指定的未来生效时间变更（当前计费周期内）：
+	// 受理时按生效时点冻结差额，到期切换套餐，周期保持不变。
+	EffectiveScheduled = "SCHEDULED"
 )
 
 // 变更申请状态机（状态只能向前流转，不可回退）：
 //
 //	PENDING ──(到期推进)──> EFFECTIVE
 //	   │
+//	   ├──(到期未支付)────> FAILED
 //	   ├──(用户取消)──────> CANCELLED
 //	   ├──(被新申请替换)──> SUPERSEDED
 //	   └──(订阅终止)──────> TERMINATED
 const (
 	ChangePending    = "PENDING"
 	ChangeEffective  = "EFFECTIVE"
+	ChangeFailed     = "FAILED"
 	ChangeCancelled  = "CANCELLED"
 	ChangeSuperseded = "SUPERSEDED"
 	ChangeTerminated = "TERMINATED"
@@ -56,11 +61,25 @@ type ChangeApplication struct {
 	ProrationRemainDays  int       `json:"prorationRemainDays,omitempty"`
 	Status               string    `json:"status"`
 	SupersedesChangeID   string    `json:"supersedesChangeId,omitempty"` // 本申请替换掉的旧申请
+	FailureReason        string    `json:"failureReason,omitempty"`      // FAILED 时记录失败原因
+	PaidAt               time.Time `json:"paidAt,omitempty"`             // 需支付申请的支付确认时间
 	Version              int64     `json:"version"`                      // 乐观锁版本
 	CreatedAt            time.Time `json:"createdAt"`
 	DecidedAt            time.Time `json:"decidedAt,omitempty"`    // 终态时间
 	ResultBillID         string    `json:"resultBillId,omitempty"` // 生效后产生的账单
 	ResultNotificationID string    `json:"resultNotificationId,omitempty"`
+}
+
+// paymentRequired 报告本申请是否需要在生效前完成支付：
+// 预约类变更（NEXT_PERIOD / SCHEDULED）差额为正时必须先收款；
+// 立即变更在生效时一并结算，不要求预先支付。
+func (ch *ChangeApplication) paymentRequired() bool {
+	return ch.EffectiveType != EffectiveImmediate && ch.SettlementAmount > 0
+}
+
+// paid 报告本申请的支付是否已确认。
+func (ch *ChangeApplication) paid() bool {
+	return !ch.PaidAt.IsZero()
 }
 
 // settlementSpec 是受理时计算并冻结的计费明细。
